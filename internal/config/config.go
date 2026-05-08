@@ -19,6 +19,7 @@ type Config struct {
 	PortMax       int
 	MaxRetries403 int
 	Timeout       time.Duration
+	DialTimeout   time.Duration
 	ServiceUser   string
 	ServicePass   string
 
@@ -34,6 +35,7 @@ func Load() (Config, error) {
 	flag.IntVar(&c.PortMax, "port-max", 10999, "max upstream port (inclusive)")
 	flag.IntVar(&c.MaxRetries403, "retries-403", 2, "how many retries to do after first 403 (GET only)")
 	flag.DurationVar(&c.Timeout, "timeout", 30*time.Second, "per-attempt timeout")
+	flag.DurationVar(&c.DialTimeout, "dial-timeout", 5*time.Second, "TCP dial timeout to upstream (fast port failover)")
 	flag.Parse()
 
 	if c.PortMin <= 0 || c.PortMax <= 0 || c.PortMin > c.PortMax {
@@ -44,6 +46,9 @@ func Load() (Config, error) {
 	}
 	if c.Timeout <= 0 || c.Timeout > 10*time.Minute {
 		return Config{}, fmt.Errorf("invalid timeout: %s", c.Timeout)
+	}
+	if c.DialTimeout <= 0 || c.DialTimeout > c.Timeout {
+		return Config{}, fmt.Errorf("invalid dial-timeout: %s (must be > 0 and <= timeout)", c.DialTimeout)
 	}
 
 	c.ServiceUser = os.Getenv("PROXY_SERVICE_USER")

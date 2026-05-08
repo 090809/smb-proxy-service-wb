@@ -8,14 +8,16 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // UpstreamConfig describes a single upstream proxy endpoint.
 type UpstreamConfig struct {
-	Host string
-	Port int
-	User string
-	Pass string
+	Host        string
+	Port        int
+	User        string
+	Pass        string
+	DialTimeout time.Duration
 }
 
 // DoGETViaUpstreamProxy forwards r as a GET request through the upstream HTTP proxy.
@@ -28,8 +30,15 @@ func DoGETViaUpstreamProxy(ctx context.Context, cfg UpstreamConfig, r *http.Requ
 		proxyURL.User = url.UserPassword(cfg.User, cfg.Pass)
 	}
 
+	dialTimeout := cfg.DialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = 5 * time.Second
+	}
 	transport := &http.Transport{
 		Proxy: http.ProxyURL(proxyURL),
+		DialContext: (&net.Dialer{
+			Timeout: dialTimeout,
+		}).DialContext,
 	}
 	client := &http.Client{Transport: transport}
 
@@ -62,8 +71,14 @@ func DoGETViaUpstreamProxy(ctx context.Context, cfg UpstreamConfig, r *http.Requ
 // On successful tunnel establishment it returns status 200 and an open upstream connection.
 // For non-200 proxy responses it returns the response status and no connection.
 func OpenCONNECTTunnelViaUpstreamProxy(ctx context.Context, cfg UpstreamConfig, target string) (net.Conn, *bufio.Reader, int, error) {
+	dialTimeout := cfg.DialTimeout
+	if dialTimeout <= 0 {
+		dialTimeout = 5 * time.Second
+	}
+	dialCtx, dialCancel := context.WithTimeout(ctx, dialTimeout)
+	defer dialCancel()
 	dialer := net.Dialer{}
-	conn, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", cfg.Host, cfg.Port))
+	conn, err := dialer.DialContext(dialCtx, "tcp", fmt.Sprintf("%s:%d", cfg.Host, cfg.Port))
 	if err != nil {
 		return nil, nil, 0, err
 	}

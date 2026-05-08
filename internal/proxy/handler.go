@@ -22,6 +22,7 @@ type HandlerConfig struct {
 	Picker        PortPicker
 	MaxRetries403 int
 	Timeout       time.Duration
+	DialTimeout   time.Duration
 	ServiceUser   string
 	ServicePass   string
 
@@ -95,10 +96,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
 		resp, err := DoGETViaUpstreamProxy(ctx, UpstreamConfig{
-			Host: h.cfg.UpstreamHost,
-			Port: port,
-			User: cred.User,
-			Pass: cred.Pass,
+			Host:        h.cfg.UpstreamHost,
+			Port:        port,
+			User:        cred.User,
+			Pass:        cred.Pass,
+			DialTimeout: h.cfg.DialTimeout,
 		}, r)
 		cancel()
 
@@ -183,10 +185,11 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request, startedA
 
 		ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
 		upstreamConn, upstreamReader, status, err := OpenCONNECTTunnelViaUpstreamProxy(ctx, UpstreamConfig{
-			Host: h.cfg.UpstreamHost,
-			Port: port,
-			User: cred.User,
-			Pass: cred.Pass,
+			Host:        h.cfg.UpstreamHost,
+			Port:        port,
+			User:        cred.User,
+			Pass:        cred.Pass,
+			DialTimeout: h.cfg.DialTimeout,
 		}, target)
 		cancel()
 
