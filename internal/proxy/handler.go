@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -52,9 +53,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// only GET, only explicit proxy requests, only http://
+	if r.Method == http.MethodConnect {
+		h.handleConnect(w, r)
+		return
+	}
+
 	if r.Method != http.MethodGet {
-		http.Error(w, "only GET is supported", http.StatusMethodNotAllowed)
+		http.Error(w, "only GET and CONNECT are supported", http.StatusMethodNotAllowed)
 		return
 	}
 	if r.URL == nil || r.URL.Scheme == "" || r.URL.Host == "" {
@@ -133,6 +138,111 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("access: %s %s -> all attempts failed status=%d channel=%d", r.Method, r.URL, lastStatus, chanIdx+1)
+	http.Error(w, fmt.Sprintf("upstream returned status %d on all attempts (channel=%d)", lastStatus, chanIdx+1), http.StatusBadGateway)
+}
+
+func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
+	target := strings.TrimSpace(r.Host)
+	if target == "" && r.URL != nil {
+		target = strings.TrimSpace(r.URL.Host)
+	}
+	if target == "" {
+		http.Error(w, "expected CONNECT host:port", http.StatusBadRequest)
+		return
+	}
+	if _, _, err := net.SplitHostPort(target); err != nil {
+		if addrErr, ok := err.(*net.AddrError); ok && addrErr.Err == "missing port in address" {
+			target = net.JoinHostPort(target, "443")
+		} else {
+			http.Error(w, "invalid CONNECT target", http.StatusBadRequest)
+			return
+		}
+	}
+
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "hijacking not supported", http.StatusInternalServerError)
+		return
+	}
+
+	chanIdx, cred := h.cfg.Creds.Next()
+	attempts := 1 + h.cfg.MaxRetries403
+	usedPorts := make(map[int]bool, attempts)
+
+	var lastStatus int
+	var lastErr error
+
+	for i := 0; i < attempts; i++ {
+		port := h.cfg.Picker.Pick(usedPorts)
+		usedPorts[port] = true
+
+		ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
+		upstreamConn, upstreamReader, status, err := OpenCONNECTTunnelViaUpstreamProxy(ctx, UpstreamConfig{
+			Host: h.cfg.UpstreamHost,
+			Port: port,
+			User: cred.User,
+			Pass: cred.Pass,
+		}, target)
+		cancel()
+
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		lastStatus = status
+		if (status == http.StatusForbidden || status == http.StatusProxyAuthRequired) && i < attempts-1 {
+			continue
+		}
+		if status == http.StatusProxyAuthRequired {
+			http.Error(w, fmt.Sprintf("upstream auth failed on all attempts (channel=%d): check upstream credentials", chanIdx+1), http.StatusBadGateway)
+			return
+		}
+		if status != http.StatusOK {
+			http.Error(w, fmt.Sprintf("upstream CONNECT failed with status %d (channel=%d)", status, chanIdx+1), http.StatusBadGateway)
+			return
+		}
+
+		clientConn, _, err := hj.Hijack()
+		if err != nil {
+			upstreamConn.Close()
+			http.Error(w, "failed to hijack client connection", http.StatusInternalServerError)
+			return
+		}
+
+		if _, err = fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection Established\r\nX-Proxy-Channel: %d\r\n\r\n", chanIdx+1); err != nil {
+			clientConn.Close()
+			upstreamConn.Close()
+			return
+		}
+
+		errCh := make(chan error, 2)
+		go func() {
+			_, copyErr := io.Copy(upstreamConn, clientConn)
+			errCh <- copyErr
+		}()
+		go func() {
+			upstreamSrc := io.Reader(upstreamConn)
+			if upstreamReader.Buffered() > 0 {
+				upstreamSrc = io.MultiReader(upstreamReader, upstreamConn)
+			}
+			_, copyErr := io.Copy(clientConn, upstreamSrc)
+			errCh <- copyErr
+		}()
+
+		<-errCh
+		clientConn.Close()
+		upstreamConn.Close()
+		log.Printf("access: CONNECT %s -> status=200 channel=%d port=%d", target, chanIdx+1, port)
+		return
+	}
+
+	if lastErr != nil {
+		log.Printf("access: CONNECT %s -> error channel=%d: %v", target, chanIdx+1, lastErr)
+		http.Error(w, fmt.Sprintf("upstream connect/request failed (channel=%d): %v", chanIdx+1, lastErr), http.StatusBadGateway)
+		return
+	}
+	log.Printf("access: CONNECT %s -> all attempts failed status=%d channel=%d", target, lastStatus, chanIdx+1)
 	http.Error(w, fmt.Sprintf("upstream returned status %d on all attempts (channel=%d)", lastStatus, chanIdx+1), http.StatusBadGateway)
 }
 
