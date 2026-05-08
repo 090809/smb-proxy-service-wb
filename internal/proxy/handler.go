@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -45,6 +46,7 @@ func NewHandler(cfg HandlerConfig) *Handler {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !h.isAuthorized(r) {
+		log.Printf("auth failed: Proxy-Authorization=%q", r.Header.Get("Proxy-Authorization"))
 		w.Header().Set("Proxy-Authenticate", `Basic realm="smb-proxy-service-wb"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return
@@ -128,12 +130,20 @@ func (h *Handler) isAuthorized(r *http.Request) bool {
 		return false
 	}
 
+	// Trim any surrounding whitespace from the whole header value.
+	proxyAuth = strings.TrimSpace(proxyAuth)
+
 	const prefix = "Basic "
 	if !strings.HasPrefix(proxyAuth, prefix) {
 		return false
 	}
 
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(strings.TrimPrefix(proxyAuth, prefix)))
+	// Use RawStdEncoding to also accept base64 without padding.
+	b64 := strings.TrimSpace(strings.TrimPrefix(proxyAuth, prefix))
+	decoded, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(b64)
+	}
 	if err != nil {
 		return false
 	}
