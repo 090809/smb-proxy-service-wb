@@ -46,15 +46,18 @@ func NewHandler(cfg HandlerConfig) *Handler {
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
+
 	if !h.isAuthorized(r) {
-		log.Printf("auth failed: Proxy-Authorization=%q", r.Header.Get("Proxy-Authorization"))
+		log.Printf("auth failed: method=%s target=%s duration=%s Proxy-Authorization=%q",
+			r.Method, requestTarget(r), time.Since(startedAt), r.Header.Get("Proxy-Authorization"))
 		w.Header().Set("Proxy-Authenticate", `Basic realm="smb-proxy-service-wb"`)
 		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
 		return
 	}
 
 	if r.Method == http.MethodConnect {
-		h.handleConnect(w, r)
+		h.handleConnect(w, r, startedAt)
 		return
 	}
 
@@ -127,21 +130,23 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		CopyResponseHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
-		log.Printf("access: %s %s -> status=%d channel=%d port=%d",
-			r.Method, r.URL, resp.StatusCode, chanIdx+1, port)
+		log.Printf("access: %s %s -> status=%d channel=%d port=%d duration=%s",
+			r.Method, r.URL, resp.StatusCode, chanIdx+1, port, time.Since(startedAt))
 		return
 	}
 
 	if lastErr != nil {
-		log.Printf("access: %s %s -> error channel=%d: %v", r.Method, r.URL, chanIdx+1, lastErr)
+		log.Printf("access: %s %s -> error channel=%d duration=%s: %v",
+			r.Method, r.URL, chanIdx+1, time.Since(startedAt), lastErr)
 		http.Error(w, fmt.Sprintf("upstream connect/request failed (channel=%d): %v", chanIdx+1, lastErr), http.StatusBadGateway)
 		return
 	}
-	log.Printf("access: %s %s -> all attempts failed status=%d channel=%d", r.Method, r.URL, lastStatus, chanIdx+1)
+	log.Printf("access: %s %s -> all attempts failed status=%d channel=%d duration=%s",
+		r.Method, r.URL, lastStatus, chanIdx+1, time.Since(startedAt))
 	http.Error(w, fmt.Sprintf("upstream returned status %d on all attempts (channel=%d)", lastStatus, chanIdx+1), http.StatusBadGateway)
 }
 
-func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request, startedAt time.Time) {
 	target := strings.TrimSpace(r.Host)
 	if target == "" && r.URL != nil {
 		target = strings.TrimSpace(r.URL.Host)
@@ -216,6 +221,11 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		setupDuration := time.Since(startedAt)
+		log.Printf("connect-established: %s -> status=200 channel=%d port=%d setup_duration=%s",
+			target, chanIdx+1, port, setupDuration)
+		tunnelStartedAt := time.Now()
+
 		errCh := make(chan error, 2)
 		go func() {
 			_, copyErr := io.Copy(upstreamConn, clientConn)
@@ -230,20 +240,44 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request) {
 			errCh <- copyErr
 		}()
 
-		<-errCh
+		copyErr := <-errCh
 		clientConn.Close()
 		upstreamConn.Close()
-		log.Printf("access: CONNECT %s -> status=200 channel=%d port=%d", target, chanIdx+1, port)
+		if copyErr != nil && copyErr != io.EOF {
+			log.Printf("connect-closed: %s -> channel=%d port=%d tunnel_duration=%s copy_err=%v",
+				target, chanIdx+1, port, time.Since(tunnelStartedAt), copyErr)
+		} else {
+			log.Printf("connect-closed: %s -> channel=%d port=%d tunnel_duration=%s",
+				target, chanIdx+1, port, time.Since(tunnelStartedAt))
+		}
 		return
 	}
 
 	if lastErr != nil {
-		log.Printf("access: CONNECT %s -> error channel=%d: %v", target, chanIdx+1, lastErr)
+		log.Printf("access: CONNECT %s -> error channel=%d duration=%s: %v",
+			target, chanIdx+1, time.Since(startedAt), lastErr)
 		http.Error(w, fmt.Sprintf("upstream connect/request failed (channel=%d): %v", chanIdx+1, lastErr), http.StatusBadGateway)
 		return
 	}
-	log.Printf("access: CONNECT %s -> all attempts failed status=%d channel=%d", target, lastStatus, chanIdx+1)
+	log.Printf("access: CONNECT %s -> all attempts failed status=%d channel=%d duration=%s",
+		target, lastStatus, chanIdx+1, time.Since(startedAt))
 	http.Error(w, fmt.Sprintf("upstream returned status %d on all attempts (channel=%d)", lastStatus, chanIdx+1), http.StatusBadGateway)
+}
+
+func requestTarget(r *http.Request) string {
+	if r.Method == http.MethodConnect {
+		if r.Host != "" {
+			return r.Host
+		}
+		if r.URL != nil {
+			return r.URL.Host
+		}
+		return ""
+	}
+	if r.URL != nil {
+		return r.URL.String()
+	}
+	return ""
 }
 
 func (h *Handler) isAuthorized(r *http.Request) bool {
