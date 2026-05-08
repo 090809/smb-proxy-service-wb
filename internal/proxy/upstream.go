@@ -34,8 +34,21 @@ func DoGETViaUpstreamProxy(ctx context.Context, cfg UpstreamConfig, r *http.Requ
 	if err != nil {
 		return nil, err
 	}
-	// Copy safe headers from the original request.
+	// Copy safe headers from the original request, excluding hop-by-hop and proxy auth.
+	skipHeaders := map[string]bool{
+		"Proxy-Authorization": true,
+		"Proxy-Connection":    true,
+		"Connection":          true,
+		"Keep-Alive":          true,
+		"Te":                  true,
+		"Trailers":            true,
+		"Transfer-Encoding":   true,
+		"Upgrade":             true,
+	}
 	for key, vals := range r.Header {
+		if skipHeaders[key] {
+			continue
+		}
 		outReq.Header[key] = vals
 	}
 
