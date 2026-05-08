@@ -1,31 +1,9 @@
 package proxy
 
 import (
-	"sync"
 	"testing"
 	"time"
 )
-
-type sequencePicker struct {
-	mu   sync.Mutex
-	seq  []int
-	next int
-}
-
-func (p *sequencePicker) Pick(used map[int]bool) int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	for i := 0; i < len(p.seq); i++ {
-		idx := (p.next + i) % len(p.seq)
-		port := p.seq[idx]
-		if !used[port] {
-			p.next = idx + 1
-			return port
-		}
-	}
-	return p.seq[0]
-}
 
 func TestBadPortState_ExponentialCooldownWithCap(t *testing.T) {
 	state := newBadPortState(10*time.Millisecond, 40*time.Millisecond)
@@ -49,22 +27,21 @@ func TestBadPortState_ExponentialCooldownWithCap(t *testing.T) {
 	}
 }
 
-func TestPickPort_PrefersHealthyOverPenalized(t *testing.T) {
-	picker := &sequencePicker{seq: []int{10001, 10002}}
+func TestSelectPort_PrefersHealthyOverPenalized(t *testing.T) {
+	getPool := NewUpstreamGETPool("example.test", 500*time.Millisecond, []Credential{{User: "u", Pass: "p"}}, 10001, 10002, time.Second, time.Minute)
+	connectPool := NewUpstreamCONNECTPool("example.test", 500*time.Millisecond, []Credential{{User: "u", Pass: "p"}}, 10001, 10002, 45*time.Second, time.Second, time.Minute)
 	h := NewHandler(HandlerConfig{
-		UpstreamHost:        "example.test",
-		Picker:              picker,
-		MaxRetries403:       0,
-		Timeout:             1 * time.Second,
-		DialTimeout:         500 * time.Millisecond,
-		BadProxyPickSamples: 2,
-		ServiceUser:         "svc",
-		ServicePass:         "svc-pass",
-		Creds:               NewCredentialProvider([]Credential{{User: "u", Pass: "p"}}),
+		MaxRetries403: 0,
+		Timeout:       1 * time.Second,
+		ServiceUser:   "svc",
+		ServicePass:   "svc-pass",
+		GETPool:       getPool,
+		CONNECTPool:   connectPool,
+		Creds:         NewCredentialProvider([]Credential{{User: "u", Pass: "p"}}),
 	})
 
 	h.badPorts.MarkFailure(10001)
-	port := h.pickPort(map[int]bool{}, 0, false)
+	port := h.selectPort(0, false)
 	if port != 10002 {
 		t.Fatalf("expected healthy port 10002, got %d", port)
 	}

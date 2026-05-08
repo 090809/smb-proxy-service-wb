@@ -4,43 +4,35 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 )
 
-type PortPicker interface {
-	Pick(used map[int]bool) int
-}
-
 type HandlerConfig struct {
-	UpstreamHost            string
-	Picker                  PortPicker
-	MaxRetries403           int
-	Timeout                 time.Duration
-	DialTimeout             time.Duration
-	KeepAliveIdleTimeout    time.Duration
-	KeepAliveMaxIdleConns   int
-	KeepAliveMaxIdlePerHost int
-	StickyPortTTL           time.Duration
-	BadProxyPenaltyBase     time.Duration
-	BadProxyPenaltyMax      time.Duration
-	BadProxyPickSamples     int
-	ServiceUser             string
-	ServicePass             string
+	MaxRetries403 int
+	Timeout       time.Duration
+	StickyPortTTL time.Duration
+	ServiceUser   string
+	ServicePass   string
+	GETPool       *UpstreamGETPool
+	CONNECTPool   *UpstreamCONNECTPool
 
 	Creds *CredentialProvider
 }
 
 type Handler struct {
-	cfg      HandlerConfig
-	sticky   *stickyPortState
-	badPorts *badPortState
+	cfg          HandlerConfig
+	sticky       *stickyPortState
+	badPorts     *badPortState
+	portSelector *portSelector
+	getPool      *UpstreamGETPool
+	connectPool  *UpstreamCONNECTPool
 }
 
 type badPortState struct {
@@ -113,41 +105,26 @@ func (s *stickyPortState) Delete(chanID int) {
 }
 
 func NewHandler(cfg HandlerConfig) *Handler {
-	if cfg.Picker == nil {
-		panic("Picker is required")
-	}
 	if cfg.Creds == nil {
 		panic("Creds provider is required")
+	}
+	if cfg.GETPool == nil {
+		panic("GET pool is required")
+	}
+	if cfg.CONNECTPool == nil {
+		panic("CONNECT pool is required")
 	}
 	if cfg.ServiceUser == "" || cfg.ServicePass == "" {
 		panic("Service auth is required")
 	}
-	if cfg.KeepAliveIdleTimeout <= 0 {
-		cfg.KeepAliveIdleTimeout = 90 * time.Second
-	}
-	if cfg.KeepAliveMaxIdleConns <= 0 {
-		cfg.KeepAliveMaxIdleConns = 1000
-	}
-	if cfg.KeepAliveMaxIdlePerHost <= 0 {
-		cfg.KeepAliveMaxIdlePerHost = 100
-	}
-	if cfg.BadProxyPenaltyBase <= 0 {
-		cfg.BadProxyPenaltyBase = 15 * time.Second
-	}
-	if cfg.BadProxyPenaltyMax <= 0 {
-		cfg.BadProxyPenaltyMax = 5 * time.Minute
-	}
-	if cfg.BadProxyPenaltyMax < cfg.BadProxyPenaltyBase {
-		cfg.BadProxyPenaltyMax = cfg.BadProxyPenaltyBase
-	}
-	if cfg.BadProxyPickSamples <= 0 {
-		cfg.BadProxyPickSamples = 8
-	}
 
 	return &Handler{
-		cfg:      cfg,
-		sticky:   newStickyPortState(cfg.StickyPortTTL),
-		badPorts: newBadPortState(cfg.BadProxyPenaltyBase, cfg.BadProxyPenaltyMax),
+		cfg:          cfg,
+		sticky:       newStickyPortState(cfg.StickyPortTTL),
+		badPorts:     cfg.GETPool.badPorts,
+		portSelector: cfg.GETPool.selector,
+		getPool:      cfg.GETPool,
+		connectPool:  cfg.CONNECTPool,
 	}
 }
 
@@ -160,6 +137,10 @@ func newBadPortState(base, max time.Duration) *badPortState {
 }
 
 func (s *badPortState) MarkFailure(port int) time.Duration {
+	return s.MarkFailureFor(port, 0)
+}
+
+func (s *badPortState) MarkFailureFor(port int, forced time.Duration) time.Duration {
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -170,16 +151,19 @@ func (s *badPortState) MarkFailure(port int) time.Duration {
 	}
 	entry.failures++
 
-	dur := s.base
-	for i := 1; i < entry.failures; i++ {
-		if dur >= s.max {
-			dur = s.max
-			break
-		}
-		dur *= 2
-		if dur > s.max {
-			dur = s.max
-			break
+	dur := forced
+	if dur <= 0 {
+		dur = s.base
+		for i := 1; i < entry.failures; i++ {
+			if dur >= s.max {
+				dur = s.max
+				break
+			}
+			dur *= 2
+			if dur > s.max {
+				dur = s.max
+				break
+			}
 		}
 	}
 
@@ -224,42 +208,29 @@ func (s *badPortState) RemainingPenalty(port int) time.Duration {
 	return entry.until.Sub(now)
 }
 
-func (h *Handler) pickPort(used map[int]bool, stickyPort int, hasSticky bool) int {
-	if hasSticky && !used[stickyPort] && !h.badPorts.IsPenalized(stickyPort) {
+func (h *Handler) selectPort(stickyPort int, hasSticky bool) int {
+	if hasSticky && !h.badPorts.IsPenalized(stickyPort) {
 		return stickyPort
 	}
-
-	candidateUsed := make(map[int]bool, len(used)+h.cfg.BadProxyPickSamples)
-	for p := range used {
-		candidateUsed[p] = true
+	port, ok := h.portSelector.pick(h.badPorts.IsPenalized)
+	if ok {
+		return port
 	}
-
-	bestPort := 0
-	bestPenalty := time.Duration(1<<63 - 1)
-	haveBest := false
-
-	for i := 0; i < h.cfg.BadProxyPickSamples; i++ {
-		port := h.cfg.Picker.Pick(candidateUsed)
-		candidateUsed[port] = true
-		penalty := h.badPorts.RemainingPenalty(port)
-		if penalty == 0 {
-			return port
-		}
-		if !haveBest || penalty < bestPenalty {
-			haveBest = true
-			bestPort = port
-			bestPenalty = penalty
-		}
-	}
-
-	if haveBest {
-		return bestPort
-	}
-	return h.cfg.Picker.Pick(used)
+	port, _ = h.portSelector.pick(nil)
+	return port
 }
 
 func (h *Handler) markBadPort(port int, chanIdx int, reason string) {
-	penalty := h.badPorts.MarkFailure(port)
+	h.markBadPortFor(port, chanIdx, reason, 0)
+}
+
+func (h *Handler) markBadPortFor(port int, chanIdx int, reason string, penaltyOverride time.Duration) {
+	var penalty time.Duration
+	if penaltyOverride > 0 {
+		penalty = h.badPorts.MarkFailureFor(port, penaltyOverride)
+	} else {
+		penalty = h.badPorts.MarkFailure(port)
+	}
 	if stickyPort, ok := h.sticky.Get(chanIdx); ok && stickyPort == port {
 		h.sticky.Delete(chanIdx)
 	}
@@ -301,60 +272,56 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
 	}
 
-	// Select one of 6 channels (credentials) per request.
-	chanIdx, cred := h.cfg.Creds.Next()
-	stickyPort, hasStickyPort := h.sticky.Get(chanIdx)
-
 	attempts := 1 + h.cfg.MaxRetries403
-	usedPorts := make(map[int]bool, attempts)
 
 	var lastStatus int
 	var lastErr error
+	lastChanIdx := -1
 
 	for i := 0; i < attempts; i++ {
-		port := h.pickPort(usedPorts, stickyPort, i == 0 && hasStickyPort)
-		usedPorts[port] = true
-
 		ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
-		resp, err := DoGETViaUpstreamProxy(ctx, UpstreamConfig{
-			Host:                    h.cfg.UpstreamHost,
-			Port:                    port,
-			User:                    cred.User,
-			Pass:                    cred.Pass,
-			DialTimeout:             h.cfg.DialTimeout,
-			KeepAliveIdleTimeout:    h.cfg.KeepAliveIdleTimeout,
-			KeepAliveMaxIdleConns:   h.cfg.KeepAliveMaxIdleConns,
-			KeepAliveMaxIdlePerHost: h.cfg.KeepAliveMaxIdlePerHost,
-		}, r)
-		cancel()
+		resp, chanIdx, port, err := h.getPool.Do(ctx, r)
 
 		if err != nil {
-			h.markBadPort(port, chanIdx, "dial_or_request_error")
-			lastErr = err
+			cancel()
+			if port != 0 && chanIdx >= 0 {
+				h.markBadPort(port, chanIdx, "dial_or_request_error")
+			}
+			if errors.Is(err, errUpstreamPoolEmpty) {
+				lastErr = fmt.Errorf("no prewarmed upstream connection available: %w", err)
+			} else {
+				lastErr = err
+			}
 			continue
 		}
-		defer resp.Body.Close()
 
 		lastStatus = resp.StatusCode
+		lastChanIdx = chanIdx
 
-		// Retry policy: 403/407 from upstream -> retry on another port, same credential channel.
+		// Retry policy: retry on another port for statuses that invalidate the current upstream path.
+		if shouldCooldownEndpoint(resp.StatusCode) && i < attempts-1 {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			cancel()
+			continue
+		}
 		// 407 from upstream must NOT be forwarded to client (client would think it's our auth).
-		if (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusProxyAuthRequired) && i < attempts-1 {
+		if resp.StatusCode == http.StatusProxyAuthRequired && i < attempts-1 {
 			h.markBadPort(port, chanIdx, fmt.Sprintf("status_%d", resp.StatusCode))
 			io.Copy(io.Discard, resp.Body)
 			resp.Body.Close()
+			cancel()
 			continue
 		}
 		// Convert upstream 407 to 502 so client doesn't confuse it with our proxy auth.
 		if resp.StatusCode == http.StatusProxyAuthRequired {
 			h.markBadPort(port, chanIdx, "status_407")
 			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			cancel()
 			http.Error(w, fmt.Sprintf("upstream auth failed on all attempts (channel=%d): check upstream credentials", chanIdx+1), http.StatusBadGateway)
 			return
 		}
-
-		h.badPorts.MarkSuccess(port)
-		h.sticky.Set(chanIdx, port)
 
 		// Optional debug header (can remove if you don't want to leak internals to 1C):
 		w.Header().Set("X-Proxy-Channel", fmt.Sprintf("%d", chanIdx+1))
@@ -362,38 +329,45 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		CopyResponseHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
+		resp.Body.Close()
+		cancel()
 		log.Printf("access: %s %s -> status=%d channel=%d port=%d duration=%s",
 			r.Method, r.URL, resp.StatusCode, chanIdx+1, port, time.Since(startedAt))
 		return
 	}
 
 	if lastErr != nil {
-		log.Printf("access: %s %s -> error channel=%d duration=%s: %v",
-			r.Method, r.URL, chanIdx+1, time.Since(startedAt), lastErr)
-		http.Error(w, fmt.Sprintf("upstream connect/request failed (channel=%d): %v", chanIdx+1, lastErr), http.StatusBadGateway)
+		channelLabel := "unknown"
+		if lastChanIdx >= 0 {
+			channelLabel = fmt.Sprintf("%d", lastChanIdx+1)
+		}
+		log.Printf("access: %s %s -> error channel=%s duration=%s: %v",
+			r.Method, r.URL, channelLabel, time.Since(startedAt), lastErr)
+		http.Error(w, fmt.Sprintf("upstream connect/request failed (channel=%s): %v", channelLabel, lastErr), http.StatusBadGateway)
 		return
 	}
-	log.Printf("access: %s %s -> all attempts failed status=%d channel=%d duration=%s",
-		r.Method, r.URL, lastStatus, chanIdx+1, time.Since(startedAt))
-	http.Error(w, fmt.Sprintf("upstream returned status %d on all attempts (channel=%d)", lastStatus, chanIdx+1), http.StatusBadGateway)
+	channelLabel := "unknown"
+	if lastChanIdx >= 0 {
+		channelLabel = fmt.Sprintf("%d", lastChanIdx+1)
+	}
+	log.Printf("access: %s %s -> all attempts failed status=%d channel=%s duration=%s",
+		r.Method, r.URL, lastStatus, channelLabel, time.Since(startedAt))
+	http.Error(w, fmt.Sprintf("upstream returned status %d on all attempts (channel=%s)", lastStatus, channelLabel), http.StatusBadGateway)
 }
 
 func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request, startedAt time.Time) {
-	target := strings.TrimSpace(r.Host)
-	if target == "" && r.URL != nil {
-		target = strings.TrimSpace(r.URL.Host)
+	rawTarget := strings.TrimSpace(r.Host)
+	if rawTarget == "" && r.URL != nil {
+		rawTarget = strings.TrimSpace(r.URL.Host)
 	}
-	if target == "" {
+	if rawTarget == "" {
 		http.Error(w, "expected CONNECT host:port", http.StatusBadRequest)
 		return
 	}
-	if _, _, err := net.SplitHostPort(target); err != nil {
-		if addrErr, ok := err.(*net.AddrError); ok && addrErr.Err == "missing port in address" {
-			target = net.JoinHostPort(target, "443")
-		} else {
-			http.Error(w, "invalid CONNECT target", http.StatusBadRequest)
-			return
-		}
+	target, err := canonicalConnectTarget(rawTarget)
+	if err != nil {
+		http.Error(w, "invalid CONNECT target", http.StatusBadRequest)
+		return
 	}
 
 	hj, ok := w.(http.Hijacker)
@@ -402,107 +376,57 @@ func (h *Handler) handleConnect(w http.ResponseWriter, r *http.Request, startedA
 		return
 	}
 
-	chanIdx, cred := h.cfg.Creds.Next()
-	stickyPort, hasStickyPort := h.sticky.Get(chanIdx)
-	attempts := 1 + h.cfg.MaxRetries403
-	usedPorts := make(map[int]bool, attempts)
+	ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
+	pt, err := h.connectPool.Acquire(ctx, target)
+	cancel()
+	if err != nil {
+		log.Printf("access: CONNECT %s -> error duration=%s: %v", target, time.Since(startedAt), err)
+		http.Error(w, fmt.Sprintf("upstream connect/request failed: %v", err), http.StatusBadGateway)
+		return
+	}
 
-	var lastStatus int
-	var lastErr error
+	clientConn, _, err := hj.Hijack()
+	if err != nil {
+		pt.channel.releaseFailed(pt, 0)
+		http.Error(w, "failed to hijack client connection", http.StatusInternalServerError)
+		return
+	}
 
-	for i := 0; i < attempts; i++ {
-		port := h.pickPort(usedPorts, stickyPort, i == 0 && hasStickyPort)
-		usedPorts[port] = true
-
-		ctx, cancel := context.WithTimeout(r.Context(), h.cfg.Timeout)
-		upstreamConn, upstreamReader, status, err := OpenCONNECTTunnelViaUpstreamProxy(ctx, UpstreamConfig{
-			Host:        h.cfg.UpstreamHost,
-			Port:        port,
-			User:        cred.User,
-			Pass:        cred.Pass,
-			DialTimeout: h.cfg.DialTimeout,
-		}, target)
-		cancel()
-
-		if err != nil {
-			h.markBadPort(port, chanIdx, "connect_dial_error")
-			lastErr = err
-			continue
-		}
-
-		lastStatus = status
-		if (status == http.StatusForbidden || status == http.StatusProxyAuthRequired) && i < attempts-1 {
-			h.markBadPort(port, chanIdx, fmt.Sprintf("connect_status_%d", status))
-			continue
-		}
-		if status == http.StatusProxyAuthRequired {
-			h.markBadPort(port, chanIdx, "connect_status_407")
-			http.Error(w, fmt.Sprintf("upstream auth failed on all attempts (channel=%d): check upstream credentials", chanIdx+1), http.StatusBadGateway)
-			return
-		}
-		if status != http.StatusOK {
-			h.markBadPort(port, chanIdx, fmt.Sprintf("connect_status_%d", status))
-			http.Error(w, fmt.Sprintf("upstream CONNECT failed with status %d (channel=%d)", status, chanIdx+1), http.StatusBadGateway)
-			return
-		}
-
-		h.badPorts.MarkSuccess(port)
-		h.sticky.Set(chanIdx, port)
-
-		clientConn, _, err := hj.Hijack()
-		if err != nil {
-			upstreamConn.Close()
-			http.Error(w, "failed to hijack client connection", http.StatusInternalServerError)
-			return
-		}
-
-		if _, err = fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection Established\r\nX-Proxy-Channel: %d\r\n\r\n", chanIdx+1); err != nil {
-			clientConn.Close()
-			upstreamConn.Close()
-			return
-		}
-
-		setupDuration := time.Since(startedAt)
-		log.Printf("connect-established: %s -> status=200 channel=%d port=%d setup_duration=%s",
-			target, chanIdx+1, port, setupDuration)
-		tunnelStartedAt := time.Now()
-
-		errCh := make(chan error, 2)
-		go func() {
-			_, copyErr := io.Copy(upstreamConn, clientConn)
-			errCh <- copyErr
-		}()
-		go func() {
-			upstreamSrc := io.Reader(upstreamConn)
-			if upstreamReader.Buffered() > 0 {
-				upstreamSrc = io.MultiReader(upstreamReader, upstreamConn)
-			}
-			_, copyErr := io.Copy(clientConn, upstreamSrc)
-			errCh <- copyErr
-		}()
-
-		copyErr := <-errCh
+	if _, err = fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection Established\r\nX-Proxy-Channel: %d\r\n\r\n", pt.channel.chanID+1); err != nil {
 		clientConn.Close()
-		upstreamConn.Close()
-		if copyErr != nil && copyErr != io.EOF {
-			log.Printf("connect-closed: %s -> channel=%d port=%d tunnel_duration=%s copy_err=%v",
-				target, chanIdx+1, port, time.Since(tunnelStartedAt), copyErr)
-		} else {
-			log.Printf("connect-closed: %s -> channel=%d port=%d tunnel_duration=%s",
-				target, chanIdx+1, port, time.Since(tunnelStartedAt))
-		}
+		pt.channel.releaseFailed(pt, 0)
 		return
 	}
 
-	if lastErr != nil {
-		log.Printf("access: CONNECT %s -> error channel=%d duration=%s: %v",
-			target, chanIdx+1, time.Since(startedAt), lastErr)
-		http.Error(w, fmt.Sprintf("upstream connect/request failed (channel=%d): %v", chanIdx+1, lastErr), http.StatusBadGateway)
-		return
+	setupDuration := time.Since(startedAt)
+	log.Printf("connect-established: %s -> status=200 channel=%d port=%d setup_duration=%s",
+		target, pt.channel.chanID+1, pt.cfg.Port, setupDuration)
+	tunnelStartedAt := time.Now()
+
+	errCh := make(chan error, 2)
+	go func() {
+		_, copyErr := io.Copy(pt.conn, clientConn)
+		errCh <- copyErr
+	}()
+	go func() {
+		upstreamSrc := io.Reader(pt.conn)
+		if pt.reader.Buffered() > 0 {
+			upstreamSrc = io.MultiReader(pt.reader, pt.conn)
+		}
+		_, copyErr := io.Copy(clientConn, upstreamSrc)
+		errCh <- copyErr
+	}()
+
+	copyErr := <-errCh
+	clientConn.Close()
+	pt.channel.releaseConsumed(pt)
+	if copyErr != nil && copyErr != io.EOF {
+		log.Printf("connect-closed: %s -> channel=%d port=%d tunnel_duration=%s copy_err=%v",
+			target, pt.channel.chanID+1, pt.cfg.Port, time.Since(tunnelStartedAt), copyErr)
+	} else {
+		log.Printf("connect-closed: %s -> channel=%d port=%d tunnel_duration=%s",
+			target, pt.channel.chanID+1, pt.cfg.Port, time.Since(tunnelStartedAt))
 	}
-	log.Printf("access: CONNECT %s -> all attempts failed status=%d channel=%d duration=%s",
-		target, lastStatus, chanIdx+1, time.Since(startedAt))
-	http.Error(w, fmt.Sprintf("upstream returned status %d on all attempts (channel=%d)", lastStatus, chanIdx+1), http.StatusBadGateway)
 }
 
 func requestTarget(r *http.Request) string {
