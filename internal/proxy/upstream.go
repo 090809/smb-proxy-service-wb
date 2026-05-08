@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 )
 
@@ -18,6 +19,74 @@ type UpstreamConfig struct {
 	User        string
 	Pass        string
 	DialTimeout time.Duration
+	KeepAliveIdleTimeout    time.Duration
+	KeepAliveMaxIdleConns   int
+	KeepAliveMaxIdlePerHost int
+}
+
+type pooledClient struct {
+	client *http.Client
+}
+
+var upstreamHTTPClientPool sync.Map
+
+func defaultKeepAliveIdleTimeout(v time.Duration) time.Duration {
+	if v <= 0 {
+		return 90 * time.Second
+	}
+	return v
+}
+
+func defaultKeepAliveMaxIdleConns(v int) int {
+	if v <= 0 {
+		return 1000
+	}
+	return v
+}
+
+func defaultKeepAliveMaxIdlePerHost(v int) int {
+	if v <= 0 {
+		return 100
+	}
+	return v
+}
+
+func upstreamClientPoolKey(cfg UpstreamConfig) string {
+	return fmt.Sprintf("%s:%d|%s|%s|dial=%s|idle=%s|maxIdle=%d|maxIdleHost=%d",
+		cfg.Host,
+		cfg.Port,
+		cfg.User,
+		cfg.Pass,
+		cfg.DialTimeout,
+		defaultKeepAliveIdleTimeout(cfg.KeepAliveIdleTimeout),
+		defaultKeepAliveMaxIdleConns(cfg.KeepAliveMaxIdleConns),
+		defaultKeepAliveMaxIdlePerHost(cfg.KeepAliveMaxIdlePerHost),
+	)
+}
+
+func getOrCreateUpstreamHTTPClient(cfg UpstreamConfig, proxyURL *url.URL) *http.Client {
+	key := upstreamClientPoolKey(cfg)
+	if v, ok := upstreamHTTPClientPool.Load(key); ok {
+		return v.(*pooledClient).client
+	}
+
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		DialContext: (&net.Dialer{
+			Timeout: cfg.DialTimeout,
+		}).DialContext,
+		ForceAttemptHTTP2:     false,
+		DisableKeepAlives:     false,
+		IdleConnTimeout:       defaultKeepAliveIdleTimeout(cfg.KeepAliveIdleTimeout),
+		MaxIdleConns:          defaultKeepAliveMaxIdleConns(cfg.KeepAliveMaxIdleConns),
+		MaxIdleConnsPerHost:   defaultKeepAliveMaxIdlePerHost(cfg.KeepAliveMaxIdlePerHost),
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	client := &http.Client{Transport: transport}
+
+	actual, _ := upstreamHTTPClientPool.LoadOrStore(key, &pooledClient{client: client})
+	return actual.(*pooledClient).client
 }
 
 // DoGETViaUpstreamProxy forwards r as a GET request through the upstream HTTP proxy.
@@ -34,13 +103,8 @@ func DoGETViaUpstreamProxy(ctx context.Context, cfg UpstreamConfig, r *http.Requ
 	if dialTimeout <= 0 {
 		dialTimeout = 5 * time.Second
 	}
-	transport := &http.Transport{
-		Proxy: http.ProxyURL(proxyURL),
-		DialContext: (&net.Dialer{
-			Timeout: dialTimeout,
-		}).DialContext,
-	}
-	client := &http.Client{Transport: transport}
+	cfg.DialTimeout = dialTimeout
+	client := getOrCreateUpstreamHTTPClient(cfg, proxyURL)
 
 	outReq, err := http.NewRequestWithContext(ctx, http.MethodGet, r.URL.String(), nil)
 	if err != nil {

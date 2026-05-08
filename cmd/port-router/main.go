@@ -25,14 +25,21 @@ func main() {
 	cp := proxy.NewCredentialProvider(creds)
 
 	h := proxy.NewHandler(proxy.HandlerConfig{
-		UpstreamHost:  cfg.UpstreamHost,
-		Picker:        p,
-		MaxRetries403: cfg.MaxRetries403,
-		Timeout:       cfg.Timeout,
-		DialTimeout:   cfg.DialTimeout,
-		ServiceUser:   cfg.ServiceUser,
-		ServicePass:   cfg.ServicePass,
-		Creds:         cp,
+		UpstreamHost:            cfg.UpstreamHost,
+		Picker:                  p,
+		MaxRetries403:           cfg.MaxRetries403,
+		Timeout:                 cfg.Timeout,
+		DialTimeout:             cfg.DialTimeout,
+		KeepAliveIdleTimeout:    cfg.KeepAliveIdleTimeout,
+		KeepAliveMaxIdleConns:   cfg.KeepAliveMaxIdleConns,
+		KeepAliveMaxIdlePerHost: cfg.KeepAliveMaxIdlePerHost,
+		StickyPortTTL:           cfg.StickyPortTTL,
+		BadProxyPenaltyBase:     cfg.BadProxyPenaltyBase,
+		BadProxyPenaltyMax:      cfg.BadProxyPenaltyMax,
+		BadProxyPickSamples:     cfg.BadProxyPickSamples,
+		ServiceUser:             cfg.ServiceUser,
+		ServicePass:             cfg.ServicePass,
+		Creds:                   cp,
 	})
 
 	srv := &http.Server{
