@@ -102,10 +102,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		lastStatus = resp.StatusCode
 
-		// Retry policy: 403 -> retry on another port, same credential channel.
-		if resp.StatusCode == http.StatusForbidden && i < attempts-1 {
+		// Retry policy: 403/407 from upstream -> retry on another port, same credential channel.
+		// 407 from upstream must NOT be forwarded to client (client would think it's our auth).
+		if (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusProxyAuthRequired) && i < attempts-1 {
 			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
 			continue
+		}
+		// Convert upstream 407 to 502 so client doesn't confuse it with our proxy auth.
+		if resp.StatusCode == http.StatusProxyAuthRequired {
+			io.Copy(io.Discard, resp.Body)
+			http.Error(w, fmt.Sprintf("upstream auth failed on all attempts (channel=%d): check upstream credentials", chanIdx+1), http.StatusBadGateway)
+			return
 		}
 
 		// Optional debug header (can remove if you don't want to leak internals to 1C):
