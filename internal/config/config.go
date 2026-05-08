@@ -19,6 +19,8 @@ type Config struct {
 	PortMax       int
 	MaxRetries403 int
 	Timeout       time.Duration
+	ServiceUser   string
+	ServicePass   string
 
 	Creds []Credential // len must be 6
 }
@@ -42,6 +44,12 @@ func Load() (Config, error) {
 	}
 	if c.Timeout <= 0 || c.Timeout > 10*time.Minute {
 		return Config{}, fmt.Errorf("invalid timeout: %s", c.Timeout)
+	}
+
+	c.ServiceUser = os.Getenv("PROXY_SERVICE_USER")
+	c.ServicePass = os.Getenv("PROXY_SERVICE_PASS")
+	if c.ServiceUser == "" || c.ServicePass == "" {
+		return Config{}, fmt.Errorf("missing service auth: set PROXY_SERVICE_USER and PROXY_SERVICE_PASS")
 	}
 
 	// Expect exactly 6 credential pairs in env.

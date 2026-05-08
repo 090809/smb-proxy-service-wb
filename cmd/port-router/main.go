@@ -29,6 +29,8 @@ func main() {
 		Picker:        p,
 		MaxRetries403: cfg.MaxRetries403,
 		Timeout:       cfg.Timeout,
+		ServiceUser:   cfg.ServiceUser,
+		ServicePass:   cfg.ServicePass,
 		Creds:         cp,
 	})
 

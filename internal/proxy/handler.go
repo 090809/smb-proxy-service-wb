@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +20,8 @@ type HandlerConfig struct {
 	Picker        PortPicker
 	MaxRetries403 int
 	Timeout       time.Duration
+	ServiceUser   string
+	ServicePass   string
 
 	Creds *CredentialProvider
 }
@@ -33,10 +37,19 @@ func NewHandler(cfg HandlerConfig) *Handler {
 	if cfg.Creds == nil {
 		panic("Creds provider is required")
 	}
+	if cfg.ServiceUser == "" || cfg.ServicePass == "" {
+		panic("Service auth is required")
+	}
 	return &Handler{cfg: cfg}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !h.isAuthorized(r) {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="smb-proxy-service-wb"`)
+		http.Error(w, "proxy authentication required", http.StatusProxyAuthRequired)
+		return
+	}
+
 	// only GET, only explicit proxy requests, only http://
 	if r.Method != http.MethodGet {
 		http.Error(w, "only GET is supported", http.StatusMethodNotAllowed)
@@ -107,4 +120,30 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.Error(w, fmt.Sprintf("upstream returned status %d on all attempts (channel=%d)", lastStatus, chanIdx+1), http.StatusBadGateway)
+}
+
+func (h *Handler) isAuthorized(r *http.Request) bool {
+	proxyAuth := r.Header.Get("Proxy-Authorization")
+	if proxyAuth == "" {
+		return false
+	}
+
+	const prefix = "Basic "
+	if !strings.HasPrefix(proxyAuth, prefix) {
+		return false
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(strings.TrimPrefix(proxyAuth, prefix)))
+	if err != nil {
+		return false
+	}
+
+	parts := strings.SplitN(string(decoded), ":", 2)
+	if len(parts) != 2 {
+		return false
+	}
+
+	userOK := subtle.ConstantTimeCompare([]byte(parts[0]), []byte(h.cfg.ServiceUser)) == 1
+	passOK := subtle.ConstantTimeCompare([]byte(parts[1]), []byte(h.cfg.ServicePass)) == 1
+	return userOK && passOK
 }
