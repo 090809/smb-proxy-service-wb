@@ -122,13 +122,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		CopyResponseHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
+		log.Printf("access: %s %s -> status=%d channel=%d port=%d",
+			r.Method, r.URL, resp.StatusCode, chanIdx+1, port)
 		return
 	}
 
 	if lastErr != nil {
+		log.Printf("access: %s %s -> error channel=%d: %v", r.Method, r.URL, chanIdx+1, lastErr)
 		http.Error(w, fmt.Sprintf("upstream connect/request failed (channel=%d): %v", chanIdx+1, lastErr), http.StatusBadGateway)
 		return
 	}
+	log.Printf("access: %s %s -> all attempts failed status=%d channel=%d", r.Method, r.URL, lastStatus, chanIdx+1)
 	http.Error(w, fmt.Sprintf("upstream returned status %d on all attempts (channel=%d)", lastStatus, chanIdx+1), http.StatusBadGateway)
 }
 
